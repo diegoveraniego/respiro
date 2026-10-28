@@ -17,7 +17,7 @@
   - `5-5` (respiración coherente)
   - **Personalizado**: configura libremente la duración (hasta 30 s) de cada fase (*Inhala*, *Mantiene 1*, *Exhala*, *Mantiene 2*).
 - **Temporizador opcional sin metas intrusivas**: Por defecto inicia **Sin límite** para no interrumpir ejercicios de regulación abiertos, con opción de elegir sesiones de `2`, `5`, `10` o `15 min` desde la configuración.
-- **Guía sonora armónica opcional**: Tonos suaves de cuenco sintetizados en memoria al cambiar de fase para poder practicar con los ojos cerrados.
+- **Sintetizador de ruido marrón filtrado (opcional)**: Generador en tiempo real de *Brown Noise* estereofónico pasado por un filtro pasa-banda resonante (SVF) cuya frecuencia de corte y factor $Q$ suben suavemente al inhalar, se sostienen al mantener y descienden al exhalar, como el oleaje o la propia respiración.
 - **Interfaz libre de distracciones**:
   - Icono sutil de estado en pausa en la parte inferior central que se desvanece suavemente al reproducir.
   - Auto-ocultación de los botones superiores y del cursor tras 2.5 s de inactividad durante la sesión.

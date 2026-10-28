@@ -2,11 +2,17 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::{
     cell::{Cell, RefCell},
+    ffi::{CStr, c_char, c_int, c_void},
     fs,
     path::PathBuf,
-    process::{Command, Stdio},
+    ptr,
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     thread,
+    time::Duration,
 };
 
 const APP_ID: &str = "org.diego.Respiro";
@@ -114,88 +120,219 @@ fn save_config(preset: u32, d: [f64; 4], sound: bool) {
     let _ = fs::write(path, content);
 }
 
-/// Synthesize a soft singing-bowl WAV file in the user cache directory and play it asynchronously.
-fn play_phase_cue(phase: usize) {
-    thread::spawn(move || {
-        let cache_dir = glib::user_cache_dir().join("respiro");
-        let _ = fs::create_dir_all(&cache_dir);
-        let file_path = cache_dir.join(format!("cue_{phase}.wav"));
+#[repr(C)]
+struct PaSampleSpec {
+    format: c_int,
+    rate: u32,
+    channels: u8,
+}
 
-        if !file_path.exists() {
-            // Subtle warm frequencies per phase:
-            // 0 (Inhala): 432 Hz warm rise
-            // 1, 3 (Mantiene): 528 Hz soft harmonic tap
-            // 2 (Exhala): 360 Hz grounding lower tone
-            // 4 (Fin de sesión): 432 Hz + 648 Hz fifth chord
-            let (freq, overtone, duration_s, amp) = match phase {
-                0 => (432.0_f64, 864.0_f64, 0.55_f64, 0.16_f64),
-                2 => (360.0_f64, 720.0_f64, 0.60_f64, 0.15_f64),
-                4 => (432.0_f64, 648.0_f64, 0.95_f64, 0.18_f64),
-                _ => (528.0_f64, 1056.0_f64, 0.35_f64, 0.10_f64),
-            };
-            let wav = synthesize_bowl_wav(freq, overtone, duration_s, amp);
-            let _ = fs::write(&file_path, wav);
+#[repr(C)]
+struct PaBufferAttr {
+    maxlength: u32,
+    tlength: u32,
+    prebuf: u32,
+    minreq: u32,
+    fragsize: u32,
+}
+
+const PA_STREAM_PLAYBACK: c_int = 1;
+const PA_SAMPLE_FLOAT32LE: c_int = 5;
+
+#[link(name = "pulse-simple")]
+#[link(name = "pulse")]
+unsafe extern "C" {
+    fn pa_simple_new(
+        server: *const c_char,
+        name: *const c_char,
+        dir: c_int,
+        dev: *const c_char,
+        stream_name: *const c_char,
+        ss: *const PaSampleSpec,
+        map: *const c_void,
+        attr: *const PaBufferAttr,
+        error: *mut c_int,
+    ) -> *mut c_void;
+    fn pa_simple_write(
+        s: *mut c_void,
+        data: *const c_void,
+        bytes: usize,
+        error: *mut c_int,
+    ) -> c_int;
+    fn pa_simple_free(s: *mut c_void);
+}
+
+struct AudioSynth {
+    active: AtomicBool,
+    level_bits: AtomicU32, // f32 bits in 0.0..=1.0
+    phase: AtomicU32,      // 0: Inhala, 1: Mantiene1, 2: Exhala, 3: Mantiene2
+}
+
+impl AudioSynth {
+    fn spawn() -> Arc<Self> {
+        let synth = Arc::new(Self {
+            active: AtomicBool::new(false),
+            level_bits: AtomicU32::new(0.0_f32.to_bits()),
+            phase: AtomicU32::new(0),
+        });
+        let s = synth.clone();
+        thread::spawn(move || run_dsp_loop(s));
+        synth
+    }
+
+    fn update(&self, active: bool, level: f64, phase: usize) {
+        self.level_bits
+            .store((level.clamp(0.0, 1.0) as f32).to_bits(), Ordering::Relaxed);
+        self.phase.store(phase as u32, Ordering::Relaxed);
+        self.active.store(active, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct SvfBandPass {
+    ic1eq: f32,
+    ic2eq: f32,
+    lp_post: f32,
+    brown: f32,
+}
+
+impl SvfBandPass {
+    fn step(&mut self, white: f32, g: f32, k: f32) -> f32 {
+        // Leaky integration of white noise -> warm Brown Noise
+        self.brown = (self.brown + 0.028 * white).clamp(-1.0, 1.0) * 0.996;
+
+        // Cytomic SVF (Band-Pass output v1)
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        let a3 = g * a2;
+        let v3 = self.brown - self.ic2eq;
+        let v1 = a1 * self.ic1eq + a2 * v3;
+        let v2 = self.ic2eq + a2 * self.ic1eq + a3 * v3;
+        self.ic1eq = 2.0 * v1 - self.ic1eq;
+        self.ic2eq = 2.0 * v2 - self.ic2eq;
+
+        // Gentle post low-pass (~1.6 kHz) to keep texture silky
+        self.lp_post += 0.18 * (v1 - self.lp_post);
+        self.lp_post
+    }
+}
+
+fn run_dsp_loop(synth: Arc<AudioSynth>) {
+    let sample_rate = 48_000u32;
+    let frames_per_chunk = 512usize; // ~10.6 ms latency
+    let mut buf = vec![0.0_f32; frames_per_chunk * 2];
+
+    let mut rng_state = 0x853c_49e6_748f_ea9b_u64;
+    let mut next_white = || -> f32 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        let u = (rng_state >> 40) as u32;
+        (u as f32 / ((1u32 << 24) as f32)) * 2.0 - 1.0
+    };
+
+    let mut left = SvfBandPass::default();
+    let mut right = SvfBandPass::default();
+    let mut smooth_lvl = 0.0_f32;
+    let mut smooth_q = 2.2_f32;
+    let mut smooth_hold_gain = 1.0_f32;
+    let mut gate_env = 0.0_f32;
+    let mut pa_handle: *mut c_void = ptr::null_mut();
+
+    let ss = PaSampleSpec {
+        format: PA_SAMPLE_FLOAT32LE,
+        rate: sample_rate,
+        channels: 2,
+    };
+    let byte_len = (frames_per_chunk * 2 * std::mem::size_of::<f32>()) as u32;
+    let attr = PaBufferAttr {
+        maxlength: byte_len * 4,
+        tlength: byte_len * 2,
+        prebuf: byte_len,
+        minreq: byte_len,
+        fragsize: u32::MAX,
+    };
+
+    loop {
+        let is_active = synth.active.load(Ordering::Relaxed);
+        if !is_active && gate_env < 0.0002 {
+            if !pa_handle.is_null() {
+                unsafe { pa_simple_free(pa_handle) };
+                pa_handle = ptr::null_mut();
+            }
+            thread::sleep(Duration::from_millis(25));
+            continue;
         }
 
-        for cmd in ["pw-play", "paplay", "aplay"] {
-            if let Ok(mut child) = Command::new(cmd)
-                .arg(&file_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                let _ = child.wait();
-                break;
+        if pa_handle.is_null() {
+            let app_name = CStr::from_bytes_with_nul(b"Respiro\0").unwrap();
+            let stream_name = CStr::from_bytes_with_nul(b"Breathing Guide\0").unwrap();
+            let mut err: c_int = 0;
+            pa_handle = unsafe {
+                pa_simple_new(
+                    ptr::null(),
+                    app_name.as_ptr(),
+                    PA_STREAM_PLAYBACK,
+                    ptr::null(),
+                    stream_name.as_ptr(),
+                    &ss,
+                    ptr::null(),
+                    &attr,
+                    &mut err,
+                )
+            };
+            if pa_handle.is_null() {
+                thread::sleep(Duration::from_millis(100));
+                continue;
             }
         }
-    });
-}
 
-fn synthesize_bowl_wav(freq: f64, overtone: f64, duration_s: f64, amp: f64) -> Vec<u8> {
-    let sample_rate = 44_100u32;
-    let num_samples = (sample_rate as f64 * duration_s) as usize;
-    let attack_samples = (sample_rate as f64 * 0.028) as usize;
-    let data_bytes = (num_samples * 2) as u32;
+        let target_lvl = f32::from_bits(synth.level_bits.load(Ordering::Relaxed));
+        let phase = synth.phase.load(Ordering::Relaxed);
+        let is_hold = phase == 1 || phase == 3;
+        let target_q = if is_hold { 3.2_f32 } else { 2.1_f32 };
+        let target_hold_gain = if is_hold { 0.68_f32 } else { 1.0_f32 };
+        let target_gate = if is_active { 1.0_f32 } else { 0.0_f32 };
 
-    let mut buf = Vec::with_capacity(44 + num_samples * 2);
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(36 + data_bytes).to_le_bytes());
-    buf.extend_from_slice(b"WAVEfmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    buf.extend_from_slice(&1u16.to_le_bytes()); // Mono
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    buf.extend_from_slice(&2u16.to_le_bytes());
-    buf.extend_from_slice(&16u16.to_le_bytes());
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_bytes.to_le_bytes());
+        for frame in buf.chunks_exact_mut(2) {
+            gate_env += 0.0006 * (target_gate - gate_env);
+            smooth_lvl += 0.0008 * (target_lvl - smooth_lvl);
+            smooth_q += 0.0005 * (target_q - smooth_q);
+            smooth_hold_gain += 0.0005 * (target_hold_gain - smooth_hold_gain);
 
-    let tau = std::f64::consts::TAU;
-    for i in 0..num_samples {
-        let t = i as f64 / sample_rate as f64;
-        let attack = if i < attack_samples {
-            0.5 * (1.0 - (std::f64::consts::PI * i as f64 / attack_samples as f64).cos())
-        } else {
-            1.0
+            // Exponential cutoff sweep: 135 Hz (empty lungs) -> 620 Hz (full inhale)
+            let fc = 135.0_f32 * (620.0_f32 / 135.0_f32).powf(smooth_lvl);
+            let g = (std::f32::consts::PI * fc / sample_rate as f32).tan();
+            let k = 1.0 / smooth_q;
+
+            // Normalize band-pass energy as Q and cutoff vary, and swell gently with inhalation
+            let breath_swell = 0.42 + 0.58 * smooth_lvl;
+            let amp = gate_env * breath_swell * smooth_hold_gain * 0.22;
+
+            let wl = next_white();
+            let wr = next_white();
+            let sig_l = left.step(wl, g, k);
+            let sig_r = right.step(wr, g, k);
+
+            // Slight stereo cross-mix (80% L + 20% R) for natural headphones comfort
+            frame[0] = (sig_l * 0.82 + sig_r * 0.18) * amp;
+            frame[1] = (sig_r * 0.82 + sig_l * 0.18) * amp;
+        }
+
+        let mut err: c_int = 0;
+        let res = unsafe {
+            pa_simple_write(
+                pa_handle,
+                buf.as_ptr() as *const c_void,
+                buf.len() * std::mem::size_of::<f32>(),
+                &mut err,
+            )
         };
-        let decay = (-4.8 * t / duration_s).exp();
-        let overtone_decay = (-8.5 * t / duration_s).exp();
-        let signal =
-            (tau * freq * t).sin() * decay + 0.25 * (tau * overtone * t).sin() * overtone_decay;
-        let sample = (signal * attack * amp * i16::MAX as f64)
-            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-        buf.extend_from_slice(&sample.to_le_bytes());
+        if res < 0 {
+            unsafe { pa_simple_free(pa_handle) };
+            pa_handle = ptr::null_mut();
+        }
     }
-    buf
-}
-
-#[derive(Clone, Copy)]
-enum StepOutcome {
-    None,
-    PhaseChanged(usize),
-    SessionFinished,
 }
 
 struct State {
@@ -249,22 +386,21 @@ impl State {
         }
     }
 
-    fn step(&mut self, dt: f64) -> StepOutcome {
+    fn step(&mut self, dt: f64) -> bool {
         if !self.running {
-            return StepOutcome::None;
+            return false;
         }
         let total: f64 = self.durations.iter().sum();
         if total <= 0.0 {
-            return StepOutcome::None;
+            return false;
         }
         self.session_elapsed += dt;
         if self.session_limit > 0.0 && self.session_elapsed >= self.session_limit {
             self.reset();
-            return StepOutcome::SessionFinished;
+            return true;
         }
 
         self.advance_zero_phases();
-        let prev_phase = self.phase;
         self.phase_elapsed += dt;
         while self.phase_elapsed >= self.durations[self.phase] && self.durations[self.phase] > 0.0 {
             self.phase_elapsed -= self.durations[self.phase];
@@ -275,11 +411,7 @@ impl State {
                 guard += 1;
             }
         }
-        if self.phase != prev_phase {
-            StepOutcome::PhaseChanged(self.phase)
-        } else {
-            StepOutcome::None
-        }
+        false
     }
 
     fn phase_fraction(&self) -> f64 {
@@ -288,6 +420,17 @@ impl State {
             0.0
         } else {
             (self.phase_elapsed / dur).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Smooth normalized lung fullness in `0.0..=1.0` used by both visual halo and band-pass audio synth.
+    fn breath_level(&self) -> f64 {
+        let t = smoothstep(self.phase_fraction());
+        match self.phase % 4 {
+            0 => t,
+            1 => 1.0,
+            2 => 1.0 - t,
+            _ => 0.0,
         }
     }
 
@@ -402,6 +545,7 @@ fn build_ui(app: &adw::Application) {
 
     let (initial_preset, initial_durations, initial_sound) = load_config();
     let state = Rc::new(RefCell::new(State::new(initial_durations, initial_sound)));
+    let synth = AudioSynth::spawn();
 
     // Hidden probe to read GNOME `@accent_bg_color`
     let accent_probe = gtk::Box::builder()
@@ -486,7 +630,7 @@ fn build_ui(app: &adw::Application) {
         .active(initial_sound)
         .halign(gtk::Align::End)
         .valign(gtk::Align::Center)
-        .tooltip_text("Guía sonora suave al cambiar de fase")
+        .tooltip_text("Sintetizador de ruido marrón filtrado con tu respiración")
         .build();
     extra_grid.attach(&sound_lbl, 0, 1, 1, 1);
     extra_grid.attach(&sound_switch, 1, 1, 1, 1);
@@ -827,6 +971,8 @@ fn build_ui(app: &adw::Application) {
     area.add_tick_callback(glib::clone!(
         #[strong]
         state,
+        #[strong]
+        synth,
         #[weak]
         app,
         #[weak]
@@ -839,39 +985,31 @@ fn build_ui(app: &adw::Application) {
             let now = clock.frame_time();
             let mut st = state.borrow_mut();
             if st.running {
-                let mut outcome = StepOutcome::None;
+                let mut finished = false;
                 if let Some(last) = st.last_frame_us {
                     let dt = ((now - last).max(0) as f64) / 1_000_000.0;
-                    outcome = st.step(dt);
+                    finished = st.step(dt);
                 }
                 st.last_frame_us = Some(now);
-                let sound_on = st.sound_enabled;
                 let idle_us = now - st.last_motion_us;
-                if matches!(outcome, StepOutcome::SessionFinished) {
+                if finished {
                     update_inhibit(&app, &window, &mut st);
                 }
+                synth.update(st.running && st.sound_enabled, st.breath_level(), st.phase);
                 drop(st);
 
-                match outcome {
-                    StepOutcome::PhaseChanged(new_phase) if sound_on => {
-                        play_phase_cue(new_phase);
-                    }
-                    StepOutcome::SessionFinished => {
-                        if sound_on {
-                            play_phase_cue(4);
-                        }
-                        sync_ui_tick(true);
-                    }
-                    _ => {
-                        let keep_visible = popover.is_visible() || idle_us < IDLE_HIDE_US;
-                        sync_ui_tick(keep_visible);
-                    }
+                if finished {
+                    sync_ui_tick(true);
+                } else {
+                    let keep_visible = popover.is_visible() || idle_us < IDLE_HIDE_US;
+                    sync_ui_tick(keep_visible);
                 }
 
                 update_labels_tick();
                 area.queue_draw();
             } else {
                 st.last_frame_us = None;
+                synth.update(false, st.breath_level(), st.phase);
             }
             glib::ControlFlow::Continue
         }
@@ -884,6 +1022,8 @@ fn build_ui(app: &adw::Application) {
     toggle_action.connect_activate(glib::clone!(
         #[strong]
         state,
+        #[strong]
+        synth,
         #[weak]
         app,
         #[weak]
@@ -892,18 +1032,13 @@ fn build_ui(app: &adw::Application) {
         area,
         move |_, _| {
             let mut st = state.borrow_mut();
-            let starting_fresh = !st.running && st.phase_elapsed == 0.0;
             st.running = !st.running;
             st.last_frame_us = None;
             st.last_motion_us = glib::monotonic_time();
-            let play_initial_cue = st.running && starting_fresh && st.sound_enabled;
-            let phase = st.phase;
             update_inhibit(&app, &window, &mut st);
+            synth.update(st.running && st.sound_enabled, st.breath_level(), st.phase);
             drop(st);
 
-            if play_initial_cue {
-                play_phase_cue(phase);
-            }
             sync_ui_toggle(true);
             update_labels_toggle();
             area.queue_draw();
@@ -918,6 +1053,8 @@ fn build_ui(app: &adw::Application) {
     reset_action.connect_activate(glib::clone!(
         #[strong]
         state,
+        #[strong]
+        synth,
         #[weak]
         app,
         #[weak]
@@ -930,6 +1067,7 @@ fn build_ui(app: &adw::Application) {
             let mut st = state.borrow_mut();
             st.reset();
             update_inhibit(&app, &window, &mut st);
+            synth.update(false, 0.0, st.phase);
             drop(st);
             popover.popdown();
             sync_ui_reset(true);
@@ -963,19 +1101,19 @@ fn build_ui(app: &adw::Application) {
     sound_switch.connect_active_notify(glib::clone!(
         #[strong]
         state,
+        #[strong]
+        synth,
         #[weak]
         mode_dropdown,
         move |sw| {
             let active = sw.is_active();
-            let (d, phase) = {
+            let d = {
                 let mut st = state.borrow_mut();
                 st.sound_enabled = active;
-                (st.durations, st.phase)
+                synth.update(st.running && st.sound_enabled, st.breath_level(), st.phase);
+                st.durations
             };
             save_config(mode_dropdown.selected(), d, active);
-            if active {
-                play_phase_cue(phase);
-            }
         }
     ));
 
@@ -986,6 +1124,8 @@ fn build_ui(app: &adw::Application) {
     mode_dropdown.connect_selected_notify(glib::clone!(
         #[strong]
         state,
+        #[strong]
+        synth,
         #[strong]
         spins,
         #[strong]
@@ -1009,6 +1149,7 @@ fn build_ui(app: &adw::Application) {
                 st.durations = preset.durations;
                 st.reset();
                 update_inhibit(&app, &window, &mut st);
+                synth.update(false, 0.0, st.phase);
                 let d = st.durations;
                 let sound = st.sound_enabled;
                 drop(st);
