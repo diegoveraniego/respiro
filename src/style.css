@@ -1,0 +1,79 @@
+* {
+    font-family: "Adwaita Sans", "Inter", "Cantarell", sans-serif;
+}
+
+window {
+    border-radius: 24px;
+}
+
+popover.background > contents {
+    border-radius: 18px;
+}
+
+.accent-probe {
+    color: @accent_bg_color;
+}
+
+.phase-title {
+    font-family: "Adwaita Sans", "Inter", "Cantarell", sans-serif;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.2px;
+    opacity: 0.88;
+}
+
+.phase-timer {
+    font-family: "Adwaita Sans", "Inter", "Cantarell", sans-serif;
+    font-size: 56px;
+    font-weight: 300;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1, "cv01" 1;
+    line-height: 1.0;
+}
+
+.corner-btn {
+    opacity: 0.36;
+    transition: opacity 200ms ease;
+}
+
+.corner-btn:hover,
+.corner-btn:checked {
+    opacity: 0.95;
+}
+
+/* Liquid Glass theme (Blur my Shell frosted glass) */
+window.liquid-glass {
+    border-radius: 24px;
+    background-color: transparent;
+    background-image:
+        radial-gradient(
+            circle at 50% 45%,
+            alpha(@accent_bg_color, 0.22),
+            alpha(@window_bg_color, 0.42) 65%,
+            alpha(@window_bg_color, 0.58) 100%
+        ),
+        linear-gradient(
+            145deg,
+            alpha(white, 0.14),
+            alpha(@window_bg_color, 0.45) 55%,
+            alpha(@accent_bg_color, 0.16)
+        );
+    box-shadow:
+        inset 0 1px 1px 0 alpha(white, 0.34),
+        inset 0 0 24px 0 alpha(white, 0.06),
+        inset 0 0 0 1px alpha(white, 0.16);
+}
+
+window.liquid-glass popover.background > contents {
+    border-radius: 18px;
+    background-color: transparent;
+    background-image: linear-gradient(
+        155deg,
+        alpha(@popover_bg_color, 0.78),
+        alpha(@popover_bg_color, 0.58)
+    );
+    box-shadow:
+        0 8px 24px alpha(black, 0.28),
+        inset 0 1px 0 0 alpha(white, 0.26),
+        inset 0 0 0 1px alpha(white, 0.15);
+}

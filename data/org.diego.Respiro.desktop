@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Respiro
+Comment=Minimalist breathing and meditation guide for GNOME
+Comment[es]=Guía minimalista de respiración y meditación para GNOME
+Exec=respiro
+Icon=org.diego.Respiro
+Terminal=false
+Categories=Utility;
+Keywords=breathing;meditation;box;calm;relax;
+Keywords[es]=respiración;meditación;calma;relajación;
+StartupNotify=true

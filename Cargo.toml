@@ -1,0 +1,10 @@
+[package]
+name = "respiro"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Minimalist GNOME box breathing and meditation guide"
+
+[dependencies]
+adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"] }
+gtk = { version = "0.11.3", package = "gtk4", features = ["v4_12"] }
