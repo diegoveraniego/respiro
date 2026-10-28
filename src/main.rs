@@ -4,10 +4,13 @@ use std::{
     cell::{Cell, RefCell},
     fs,
     path::PathBuf,
+    process::{Command, Stdio},
     rc::Rc,
+    thread,
 };
 
 const APP_ID: &str = "org.diego.Respiro";
+const IDLE_HIDE_US: i64 = 2_500_000; // 2.5 seconds before auto-hiding controls & cursor
 
 #[derive(Clone, Copy, Debug)]
 struct Pattern {
@@ -38,18 +41,47 @@ const PRESETS: &[Pattern] = &[
     },
 ];
 
+struct TimerOption {
+    label: &'static str,
+    seconds: f64,
+}
+
+const TIMER_OPTIONS: &[TimerOption] = &[
+    TimerOption {
+        label: "Sin límite",
+        seconds: 0.0,
+    },
+    TimerOption {
+        label: "2 min",
+        seconds: 120.0,
+    },
+    TimerOption {
+        label: "5 min",
+        seconds: 300.0,
+    },
+    TimerOption {
+        label: "10 min",
+        seconds: 600.0,
+    },
+    TimerOption {
+        label: "15 min",
+        seconds: 900.0,
+    },
+];
+
 const PHASE_NAMES: [&str; 4] = ["Inhala", "Mantiene", "Exhala", "Mantiene"];
 
 fn config_path() -> PathBuf {
     glib::user_config_dir().join("respiro").join("state.conf")
 }
 
-fn load_config() -> (u32, [f64; 4]) {
+fn load_config() -> (u32, [f64; 4], bool) {
     let Ok(text) = fs::read_to_string(config_path()) else {
-        return (0, PRESETS[0].durations);
+        return (0, PRESETS[0].durations, false);
     };
     let mut preset = 0u32;
     let mut d = PRESETS[0].durations;
+    let mut sound = false;
     for line in text.lines() {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim() {
@@ -58,6 +90,7 @@ fn load_config() -> (u32, [f64; 4]) {
                 "d1" => d[1] = v.trim().parse::<f64>().unwrap_or(5.0).clamp(0.0, 30.0),
                 "d2" => d[2] = v.trim().parse::<f64>().unwrap_or(5.0).clamp(1.0, 30.0),
                 "d3" => d[3] = v.trim().parse::<f64>().unwrap_or(5.0).clamp(0.0, 30.0),
+                "sound" => sound = matches!(v.trim(), "true" | "1"),
                 _ => {}
             }
         }
@@ -66,19 +99,103 @@ fn load_config() -> (u32, [f64; 4]) {
     if idx < PRESETS.len() - 1 {
         d = PRESETS[idx].durations;
     }
-    (idx as u32, d)
+    (idx as u32, d, sound)
 }
 
-fn save_config(preset: u32, d: [f64; 4]) {
+fn save_config(preset: u32, d: [f64; 4], sound: bool) {
     let path = config_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let content = format!(
-        "preset={preset}\nd0={}\nd1={}\nd2={}\nd3={}\n",
+        "preset={preset}\nd0={}\nd1={}\nd2={}\nd3={}\nsound={sound}\n",
         d[0], d[1], d[2], d[3]
     );
     let _ = fs::write(path, content);
+}
+
+/// Synthesize a soft singing-bowl WAV file in the user cache directory and play it asynchronously.
+fn play_phase_cue(phase: usize) {
+    thread::spawn(move || {
+        let cache_dir = glib::user_cache_dir().join("respiro");
+        let _ = fs::create_dir_all(&cache_dir);
+        let file_path = cache_dir.join(format!("cue_{phase}.wav"));
+
+        if !file_path.exists() {
+            // Subtle warm frequencies per phase:
+            // 0 (Inhala): 432 Hz warm rise
+            // 1, 3 (Mantiene): 528 Hz soft harmonic tap
+            // 2 (Exhala): 360 Hz grounding lower tone
+            // 4 (Fin de sesión): 432 Hz + 648 Hz fifth chord
+            let (freq, overtone, duration_s, amp) = match phase {
+                0 => (432.0_f64, 864.0_f64, 0.55_f64, 0.16_f64),
+                2 => (360.0_f64, 720.0_f64, 0.60_f64, 0.15_f64),
+                4 => (432.0_f64, 648.0_f64, 0.95_f64, 0.18_f64),
+                _ => (528.0_f64, 1056.0_f64, 0.35_f64, 0.10_f64),
+            };
+            let wav = synthesize_bowl_wav(freq, overtone, duration_s, amp);
+            let _ = fs::write(&file_path, wav);
+        }
+
+        for cmd in ["pw-play", "paplay", "aplay"] {
+            if let Ok(mut child) = Command::new(cmd)
+                .arg(&file_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let _ = child.wait();
+                break;
+            }
+        }
+    });
+}
+
+fn synthesize_bowl_wav(freq: f64, overtone: f64, duration_s: f64, amp: f64) -> Vec<u8> {
+    let sample_rate = 44_100u32;
+    let num_samples = (sample_rate as f64 * duration_s) as usize;
+    let attack_samples = (sample_rate as f64 * 0.028) as usize;
+    let data_bytes = (num_samples * 2) as u32;
+
+    let mut buf = Vec::with_capacity(44 + num_samples * 2);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    buf.extend_from_slice(b"WAVEfmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&1u16.to_le_bytes()); // Mono
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&16u16.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_bytes.to_le_bytes());
+
+    let tau = std::f64::consts::TAU;
+    for i in 0..num_samples {
+        let t = i as f64 / sample_rate as f64;
+        let attack = if i < attack_samples {
+            0.5 * (1.0 - (std::f64::consts::PI * i as f64 / attack_samples as f64).cos())
+        } else {
+            1.0
+        };
+        let decay = (-4.8 * t / duration_s).exp();
+        let overtone_decay = (-8.5 * t / duration_s).exp();
+        let signal =
+            (tau * freq * t).sin() * decay + 0.25 * (tau * overtone * t).sin() * overtone_decay;
+        let sample = (signal * attack * amp * i16::MAX as f64)
+            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        buf.extend_from_slice(&sample.to_le_bytes());
+    }
+    buf
+}
+
+#[derive(Clone, Copy)]
+enum StepOutcome {
+    None,
+    PhaseChanged(usize),
+    SessionFinished,
 }
 
 struct State {
@@ -86,18 +203,26 @@ struct State {
     durations: [f64; 4],
     phase: usize,
     phase_elapsed: f64,
+    session_elapsed: f64,
+    session_limit: f64, // 0.0 = unlimited
+    sound_enabled: bool,
     last_frame_us: Option<i64>,
+    last_motion_us: i64,
     inhibit_cookie: u32,
 }
 
 impl State {
-    fn new(durations: [f64; 4]) -> Self {
+    fn new(durations: [f64; 4], sound_enabled: bool) -> Self {
         let mut s = Self {
             running: false,
             durations,
             phase: 0,
             phase_elapsed: 0.0,
+            session_elapsed: 0.0,
+            session_limit: 0.0,
+            sound_enabled,
             last_frame_us: None,
+            last_motion_us: 0,
             inhibit_cookie: 0,
         };
         s.advance_zero_phases();
@@ -108,6 +233,7 @@ impl State {
         self.running = false;
         self.phase = 0;
         self.phase_elapsed = 0.0;
+        self.session_elapsed = 0.0;
         self.last_frame_us = None;
         self.advance_zero_phases();
     }
@@ -123,15 +249,22 @@ impl State {
         }
     }
 
-    fn step(&mut self, dt: f64) {
+    fn step(&mut self, dt: f64) -> StepOutcome {
         if !self.running {
-            return;
+            return StepOutcome::None;
         }
         let total: f64 = self.durations.iter().sum();
         if total <= 0.0 {
-            return;
+            return StepOutcome::None;
         }
+        self.session_elapsed += dt;
+        if self.session_limit > 0.0 && self.session_elapsed >= self.session_limit {
+            self.reset();
+            return StepOutcome::SessionFinished;
+        }
+
         self.advance_zero_phases();
+        let prev_phase = self.phase;
         self.phase_elapsed += dt;
         while self.phase_elapsed >= self.durations[self.phase] && self.durations[self.phase] > 0.0 {
             self.phase_elapsed -= self.durations[self.phase];
@@ -141,6 +274,11 @@ impl State {
                 self.phase = (self.phase + 1) % 4;
                 guard += 1;
             }
+        }
+        if self.phase != prev_phase {
+            StepOutcome::PhaseChanged(self.phase)
+        } else {
+            StepOutcome::None
         }
     }
 
@@ -188,24 +326,6 @@ fn accent_rgba() -> gdk::RGBA {
 fn smoothstep(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
-}
-
-/// Detect whether GNOME Shell has `blur-my-shell@aunetx` enabled.
-fn is_blur_my_shell_enabled() -> bool {
-    let Some(source) = gio::SettingsSchemaSource::default() else {
-        return false;
-    };
-    if source.lookup("org.gnome.shell", true).is_none() {
-        return false;
-    }
-    let shell = gio::Settings::new("org.gnome.shell");
-    if shell.boolean("disable-user-extensions") {
-        return false;
-    }
-    shell
-        .strv("enabled-extensions")
-        .iter()
-        .any(|ext| ext.as_str() == "blur-my-shell@aunetx")
 }
 
 /// Cubic Bézier controls `(c1, c2)` for a clockwise edge `a -> b` with outward bow and rounded corners.
@@ -280,8 +400,8 @@ fn build_ui(app: &adw::Application) {
         return;
     }
 
-    let (initial_preset, initial_durations) = load_config();
-    let state = Rc::new(RefCell::new(State::new(initial_durations)));
+    let (initial_preset, initial_durations, initial_sound) = load_config();
+    let state = Rc::new(RefCell::new(State::new(initial_durations, initial_sound)));
 
     // Hidden probe to read GNOME `@accent_bg_color`
     let accent_probe = gtk::Box::builder()
@@ -336,6 +456,43 @@ fn build_ui(app: &adw::Application) {
     );
     pop_box.append(&spins_grid);
 
+    pop_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    let extra_grid = gtk::Grid::builder()
+        .column_spacing(12)
+        .row_spacing(8)
+        .build();
+
+    let timer_lbl = gtk::Label::builder()
+        .label("Temporizador")
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let timer_labels: Vec<&str> = TIMER_OPTIONS.iter().map(|t| t.label).collect();
+    let timer_dropdown = gtk::DropDown::from_strings(&timer_labels);
+    timer_dropdown.set_selected(0); // Always defaults to "Sin límite" so regulation has no goal interruption
+    timer_dropdown.set_tooltip_text(Some("Duración de la sesión"));
+    extra_grid.attach(&timer_lbl, 0, 0, 1, 1);
+    extra_grid.attach(&timer_dropdown, 1, 0, 1, 1);
+
+    let sound_lbl = gtk::Label::builder()
+        .label("Sonido")
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let sound_switch = gtk::Switch::builder()
+        .active(initial_sound)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .tooltip_text("Guía sonora suave al cambiar de fase")
+        .build();
+    extra_grid.attach(&sound_lbl, 0, 1, 1, 1);
+    extra_grid.attach(&sound_switch, 1, 1, 1, 1);
+
+    pop_box.append(&extra_grid);
+
     let reset_btn = gtk::Button::builder()
         .label("Reiniciar")
         .css_classes(["flat"])
@@ -365,9 +522,21 @@ fn build_ui(app: &adw::Application) {
         .valign(gtk::Align::Start)
         .margin_top(12)
         .margin_end(12)
+        .css_classes(["top-controls"])
         .build();
     top_right_controls.append(&gear_btn);
     top_right_controls.append(&close_btn);
+
+    // Subtle bottom-center pause indicator icon that fades out when playing
+    let pause_icon = gtk::Image::builder()
+        .icon_name("media-playback-pause-symbolic")
+        .pixel_size(16)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::End)
+        .margin_bottom(24)
+        .can_target(false)
+        .css_classes(["pause-indicator"])
+        .build();
 
     // Main canvas
     let area = gtk::DrawingArea::builder()
@@ -405,13 +574,12 @@ fn build_ui(app: &adw::Application) {
         .vexpand(true)
         .build();
     overlay.add_overlay(&center_box);
+    overlay.add_overlay(&pause_icon);
     overlay.add_overlay(&top_right_controls);
     overlay.add_overlay(&accent_probe);
 
     // WindowHandle allows dragging borderless window from anywhere and clicking to toggle
     let win_handle = gtk::WindowHandle::builder().child(&overlay).build();
-
-    let has_blur_ext = is_blur_my_shell_enabled();
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -422,11 +590,28 @@ fn build_ui(app: &adw::Application) {
         .content(&win_handle)
         .build();
 
-    if has_blur_ext {
-        window.add_css_class("liquid-glass");
-    }
+    let sync_ui_chrome = {
+        let state = state.clone();
+        let pause_icon = pause_icon.clone();
+        let top_right_controls = top_right_controls.clone();
+        let window = window.clone();
+        move |show_controls: bool| {
+            let st = state.borrow();
+            if st.running {
+                pause_icon.add_css_class("hidden-indicator");
+            } else {
+                pause_icon.remove_css_class("hidden-indicator");
+            }
 
-    let glass_active = Rc::new(Cell::new(has_blur_ext));
+            if show_controls || !st.running {
+                top_right_controls.remove_css_class("controls-hidden");
+                window.set_cursor_from_name(None);
+            } else {
+                top_right_controls.add_css_class("controls-hidden");
+                window.set_cursor_from_name(Some("none"));
+            }
+        }
+    };
 
     let update_labels = {
         let state = state.clone();
@@ -446,18 +631,29 @@ fn build_ui(app: &adw::Application) {
         }
     };
     update_labels();
+    sync_ui_chrome(true);
+
+    // Restore controls & cursor whenever the pointer moves
+    let motion = gtk::EventControllerMotion::new();
+    let sync_ui_motion = sync_ui_chrome.clone();
+    motion.connect_motion(glib::clone!(
+        #[strong]
+        state,
+        move |_, _, _| {
+            state.borrow_mut().last_motion_us = glib::monotonic_time();
+            sync_ui_motion(true);
+        }
+    ));
+    overlay.add_controller(motion);
 
     // Draw function: dynamic polygon (2, 3, or 4 vertices) + outward-curved arcs + GNOME accent dot
     area.set_draw_func(glib::clone!(
         #[strong]
         state,
-        #[strong]
-        glass_active,
         #[weak]
         accent_probe,
         move |widget, cr, w, h| {
             let st = state.borrow();
-            let is_glass = glass_active.get();
             let fg = widget.color();
             let accent = {
                 let c = accent_probe.color();
@@ -483,36 +679,6 @@ fn build_ui(app: &adw::Application) {
                 2 => 1.30 - 0.30 * t,
                 _ => 1.0,
             };
-
-            // Ambient liquid glass diffused glow in the center
-            if is_glass {
-                let rad = size * 0.88 * (0.88 + 0.12 * breath_scale);
-                let grad = gtk::cairo::RadialGradient::new(cx, cy, 2.0, cx, cy, rad);
-                grad.add_color_stop_rgba(
-                    0.0,
-                    accent.red() as f64,
-                    accent.green() as f64,
-                    accent.blue() as f64,
-                    0.24,
-                );
-                grad.add_color_stop_rgba(
-                    0.48,
-                    accent.red() as f64,
-                    accent.green() as f64,
-                    accent.blue() as f64,
-                    0.10,
-                );
-                grad.add_color_stop_rgba(
-                    1.0,
-                    accent.red() as f64,
-                    accent.green() as f64,
-                    accent.blue() as f64,
-                    0.0,
-                );
-                let _ = cr.set_source(&grad);
-                cr.arc(cx, cy, rad, 0.0, std::f64::consts::TAU);
-                let _ = cr.fill();
-            }
 
             // Organic outward bow + smooth rounded corners at the active vertices
             let active_phases: Vec<usize> =
@@ -559,27 +725,11 @@ fn build_ui(app: &adw::Application) {
             cr.set_line_join(gtk::cairo::LineJoin::Round);
 
             // Base outward-curved edges with rounded corners
-            if is_glass {
-                cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
-                cr.set_line_width(4.5);
-                cr.move_to(vertices[0].0, vertices[0].1);
-                for i in 0..n {
-                    let prev = vertices[(i + n - 1) % n];
-                    let a = vertices[i];
-                    let b = vertices[(i + 1) % n];
-                    let next = vertices[(i + 2) % n];
-                    let (c1, c2) = edge_controls(prev, a, b, next, bow, roundness);
-                    cr.curve_to(c1.0, c1.1, c2.0, c2.1, b.0, b.1);
-                }
-                cr.close_path();
-                let _ = cr.stroke();
-            }
-
             cr.set_source_rgba(
                 fg.red() as f64,
                 fg.green() as f64,
                 fg.blue() as f64,
-                if is_glass { 0.22 } else { 0.14 },
+                0.14,
             );
             cr.set_line_width(2.5);
             cr.move_to(vertices[0].0, vertices[0].1);
@@ -604,19 +754,6 @@ fn build_ui(app: &adw::Application) {
             let (sub_c1, sub_c2, (dot_x, dot_y)) = cubic_split(start_v, c1, c2, end_v, t);
 
             if t > 0.001 {
-                if is_glass {
-                    cr.set_source_rgba(
-                        accent.red() as f64,
-                        accent.green() as f64,
-                        accent.blue() as f64,
-                        0.22,
-                    );
-                    cr.set_line_width(8.0);
-                    cr.move_to(start_v.0, start_v.1);
-                    cr.curve_to(sub_c1.0, sub_c1.1, sub_c2.0, sub_c2.1, dot_x, dot_y);
-                    let _ = cr.stroke();
-                }
-
                 cr.set_source_rgba(
                     accent.red() as f64,
                     accent.green() as f64,
@@ -652,12 +789,12 @@ fn build_ui(app: &adw::Application) {
                 let _ = cr.fill();
             }
 
-            // Moving GNOME accent dot (soft breathing halo + solid core + glass specular highlight)
+            // Moving GNOME accent dot (soft breathing halo + solid core)
             cr.set_source_rgba(
                 accent.red() as f64,
                 accent.green() as f64,
                 accent.blue() as f64,
-                if is_glass { 0.26 } else { 0.20 },
+                0.20,
             );
             cr.arc(dot_x, dot_y, 16.0 * breath_scale, 0.0, std::f64::consts::TAU);
             let _ = cr.fill();
@@ -670,12 +807,6 @@ fn build_ui(app: &adw::Application) {
             );
             cr.arc(dot_x, dot_y, 8.0, 0.0, std::f64::consts::TAU);
             let _ = cr.fill();
-
-            if is_glass {
-                cr.set_source_rgba(1.0, 1.0, 1.0, 0.55);
-                cr.arc(dot_x - 2.2, dot_y - 2.2, 2.3, 0.0, std::f64::consts::TAU);
-                let _ = cr.fill();
-            }
         }
     ));
 
@@ -692,19 +823,51 @@ fn build_ui(app: &adw::Application) {
 
     // Tick callback synced to monitor refresh rate
     let update_labels_tick = update_labels.clone();
+    let sync_ui_tick = sync_ui_chrome.clone();
     area.add_tick_callback(glib::clone!(
         #[strong]
         state,
+        #[weak]
+        app,
+        #[weak]
+        window,
+        #[weak]
+        popover,
+        #[upgrade_or]
+        glib::ControlFlow::Break,
         move |area, clock| {
             let now = clock.frame_time();
             let mut st = state.borrow_mut();
             if st.running {
+                let mut outcome = StepOutcome::None;
                 if let Some(last) = st.last_frame_us {
                     let dt = ((now - last).max(0) as f64) / 1_000_000.0;
-                    st.step(dt);
+                    outcome = st.step(dt);
                 }
                 st.last_frame_us = Some(now);
+                let sound_on = st.sound_enabled;
+                let idle_us = now - st.last_motion_us;
+                if matches!(outcome, StepOutcome::SessionFinished) {
+                    update_inhibit(&app, &window, &mut st);
+                }
                 drop(st);
+
+                match outcome {
+                    StepOutcome::PhaseChanged(new_phase) if sound_on => {
+                        play_phase_cue(new_phase);
+                    }
+                    StepOutcome::SessionFinished => {
+                        if sound_on {
+                            play_phase_cue(4);
+                        }
+                        sync_ui_tick(true);
+                    }
+                    _ => {
+                        let keep_visible = popover.is_visible() || idle_us < IDLE_HIDE_US;
+                        sync_ui_tick(keep_visible);
+                    }
+                }
+
                 update_labels_tick();
                 area.queue_draw();
             } else {
@@ -717,6 +880,7 @@ fn build_ui(app: &adw::Application) {
     // Toggle play/pause + idle inhibit
     let toggle_action = gio::SimpleAction::new("toggle", None);
     let update_labels_toggle = update_labels.clone();
+    let sync_ui_toggle = sync_ui_chrome.clone();
     toggle_action.connect_activate(glib::clone!(
         #[strong]
         state,
@@ -728,10 +892,19 @@ fn build_ui(app: &adw::Application) {
         area,
         move |_, _| {
             let mut st = state.borrow_mut();
+            let starting_fresh = !st.running && st.phase_elapsed == 0.0;
             st.running = !st.running;
             st.last_frame_us = None;
+            st.last_motion_us = glib::monotonic_time();
+            let play_initial_cue = st.running && starting_fresh && st.sound_enabled;
+            let phase = st.phase;
             update_inhibit(&app, &window, &mut st);
             drop(st);
+
+            if play_initial_cue {
+                play_phase_cue(phase);
+            }
+            sync_ui_toggle(true);
             update_labels_toggle();
             area.queue_draw();
         }
@@ -741,6 +914,7 @@ fn build_ui(app: &adw::Application) {
     // Reset action
     let reset_action = gio::SimpleAction::new("reset", None);
     let update_labels_reset = update_labels.clone();
+    let sync_ui_reset = sync_ui_chrome.clone();
     reset_action.connect_activate(glib::clone!(
         #[strong]
         state,
@@ -758,6 +932,7 @@ fn build_ui(app: &adw::Application) {
             update_inhibit(&app, &window, &mut st);
             drop(st);
             popover.popdown();
+            sync_ui_reset(true);
             update_labels_reset();
             area.queue_draw();
         }
@@ -772,9 +947,42 @@ fn build_ui(app: &adw::Application) {
         }
     ));
 
+    // Session timer selection inside popover
+    timer_dropdown.connect_selected_notify(glib::clone!(
+        #[strong]
+        state,
+        move |dd| {
+            let idx = (dd.selected() as usize).min(TIMER_OPTIONS.len() - 1);
+            let mut st = state.borrow_mut();
+            st.session_limit = TIMER_OPTIONS[idx].seconds;
+            st.session_elapsed = 0.0;
+        }
+    ));
+
+    // Sound switch inside popover
+    sound_switch.connect_active_notify(glib::clone!(
+        #[strong]
+        state,
+        #[weak]
+        mode_dropdown,
+        move |sw| {
+            let active = sw.is_active();
+            let (d, phase) = {
+                let mut st = state.borrow_mut();
+                st.sound_enabled = active;
+                (st.durations, st.phase)
+            };
+            save_config(mode_dropdown.selected(), d, active);
+            if active {
+                play_phase_cue(phase);
+            }
+        }
+    ));
+
     // Mode selection inside popover
     let updating_spins = Rc::new(Cell::new(false));
     let update_labels_mode = update_labels.clone();
+    let sync_ui_mode = sync_ui_chrome.clone();
     mode_dropdown.connect_selected_notify(glib::clone!(
         #[strong]
         state,
@@ -802,13 +1010,15 @@ fn build_ui(app: &adw::Application) {
                 st.reset();
                 update_inhibit(&app, &window, &mut st);
                 let d = st.durations;
+                let sound = st.sound_enabled;
                 drop(st);
-                save_config(idx as u32, d);
+                save_config(idx as u32, d, sound);
+                sync_ui_mode(true);
                 update_labels_mode();
                 area.queue_draw();
             } else {
-                let d = state.borrow().durations;
-                save_config(idx as u32, d);
+                let st = state.borrow();
+                save_config(idx as u32, st.durations, st.sound_enabled);
             }
         }
     ));
@@ -829,16 +1039,17 @@ fn build_ui(app: &adw::Application) {
                 if updating_spins.get() {
                     return;
                 }
-                let mut st = state.borrow_mut();
-                st.durations[i] = s.value();
-                st.advance_zero_phases();
-                let d = st.durations;
-                drop(st);
+                let (d, sound) = {
+                    let mut st = state.borrow_mut();
+                    st.durations[i] = s.value();
+                    st.advance_zero_phases();
+                    (st.durations, st.sound_enabled)
+                };
                 let custom_idx = (PRESETS.len() - 1) as u32;
                 if mode_dropdown.selected() != custom_idx {
                     mode_dropdown.set_selected(custom_idx);
                 }
-                save_config(custom_idx, d);
+                save_config(custom_idx, d, sound);
                 update_labels_spin();
                 area.queue_draw();
             }

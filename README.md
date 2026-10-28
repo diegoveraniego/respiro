@@ -16,11 +16,14 @@
   - `4-7-8` (relajación profunda)
   - `5-5` (respiración coherente)
   - **Personalizado**: configura libremente la duración (hasta 30 s) de cada fase (*Inhala*, *Mantiene 1*, *Exhala*, *Mantiene 2*).
-- **Integración nativa con GNOME**:
-  - Adopta automáticamente el color de acento del sistema (`@accent_bg_color`) y el modo claro/oscuro.
-  - **Efecto Liquid Glass**: detecta automáticamente si la extensión `blur-my-shell` está activa en GNOME Shell para habilitar un acabado translúcido con resplandor ambiental.
-  - **Inhibición de inactividad**: evita que la pantalla se apague mientras una sesión de respiración está en curso.
-  - Guarda tu último patrón y configuración automáticamente en `~/.config/respiro/state.conf`.
+- **Temporizador opcional sin metas intrusivas**: Por defecto inicia **Sin límite** para no interrumpir ejercicios de regulación abiertos, con opción de elegir sesiones de `2`, `5`, `10` o `15 min` desde la configuración.
+- **Guía sonora armónica opcional**: Tonos suaves de cuenco sintetizados en memoria al cambiar de fase para poder practicar con los ojos cerrados.
+- **Interfaz libre de distracciones**:
+  - Icono sutil de estado en pausa en la parte inferior central que se desvanece suavemente al reproducir.
+  - Auto-ocultación de los botones superiores y del cursor tras 2.5 s de inactividad durante la sesión.
+  - Adopta automáticamente el color de acento de GNOME (`@accent_bg_color`) y el tema claro/oscuro.
+  - **Inhibición de inactividad**: evita que la pantalla se apague mientras una sesión está activa.
+  - Guarda tu último patrón y preferencia de sonido en `~/.config/respiro/state.conf`.
 
 ## ⌨️ Controles y atajos
 
