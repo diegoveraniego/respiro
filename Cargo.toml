@@ -4,7 +4,24 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Minimalist GNOME box breathing and meditation guide"
+default-run = "respiro"
+
+[features]
+default = ["gui", "cli"]
+gui = ["dep:adw", "dep:gtk"]
+cli = ["dep:libc"]
+
+[[bin]]
+name = "respiro"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "respiro-cli"
+path = "src/cli/main.rs"
+required-features = ["cli"]
 
 [dependencies]
-adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"] }
-gtk = { version = "0.11.3", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"], optional = true }
+gtk = { version = "0.11.3", package = "gtk4", features = ["v4_12"], optional = true }
+libc = { version = "0.2", optional = true }

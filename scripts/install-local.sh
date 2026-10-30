@@ -3,7 +3,7 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 prefix=${RESPIRO_PREFIX:-"$HOME/.local"}
 
-cargo build --release --manifest-path "$project_dir/Cargo.toml"
+cargo build --release --bin respiro --manifest-path "$project_dir/Cargo.toml"
 install -Dm755 "$project_dir/target/release/respiro" "$prefix/bin/.respiro-install-$$"
 mv -f "$prefix/bin/.respiro-install-$$" "$prefix/bin/respiro"
 install -Dm644 "$project_dir/data/org.diego.Respiro.desktop" "$prefix/share/applications/org.diego.Respiro.desktop"

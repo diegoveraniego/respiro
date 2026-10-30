@@ -18,34 +18,8 @@ use std::{
 const APP_ID: &str = "org.diego.Respiro";
 const IDLE_HIDE_US: i64 = 2_500_000; // 2.5 seconds before auto-hiding controls & cursor
 
-#[derive(Clone, Copy, Debug)]
-struct Pattern {
-    name: &'static str,
-    durations: [f64; 4], // [inhale, hold1, exhale, hold2] in seconds
-}
-
-const PRESETS: &[Pattern] = &[
-    Pattern {
-        name: "5-5-5-5",
-        durations: [5.0, 5.0, 5.0, 5.0],
-    },
-    Pattern {
-        name: "4-4-4-4",
-        durations: [4.0, 4.0, 4.0, 4.0],
-    },
-    Pattern {
-        name: "4-7-8",
-        durations: [4.0, 7.0, 8.0, 0.0],
-    },
-    Pattern {
-        name: "5-5",
-        durations: [5.0, 0.0, 5.0, 0.0],
-    },
-    Pattern {
-        name: "Personalizado",
-        durations: [5.0, 5.0, 5.0, 5.0],
-    },
-];
+mod patterns;
+use patterns::PRESETS;
 
 struct TimerOption {
     label: &'static str,
