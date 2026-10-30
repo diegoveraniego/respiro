@@ -9,19 +9,25 @@ import select
 import signal
 import struct
 import subprocess
+import tempfile
 import termios
 import time
 
 BINARY = Path(__file__).resolve().parents[1] / "target/debug/respiro-cli"
+ANSI_SGR = re.compile(rb"\x1b\[[0-9;]*m")
 
 
 class Session:
-    def __init__(self, *args, expected_start=b"Inhale"):
+    def __init__(self, *args, expected_start=b"Inhale", extra_env=None):
         self.master, self.slave = pty.openpty()
         self.resize(80, 24)
         self.original = termios.tcgetattr(self.slave)
         env = {**os.environ, "TERM": "xterm"}
         env.pop("RESPIRO_LANG", None)
+        env.pop("NO_COLOR", None)
+        env.pop("RESPIRO_CONFIG", None)
+        if extra_env:
+            env.update(extra_env)
         self.process = subprocess.Popen(
             [str(BINARY), *args], stdin=self.slave, stdout=self.slave,
             stderr=self.slave, env=env,
@@ -81,11 +87,12 @@ for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
     check_exit(sig=sig)
 check_exit(key=b"q", compact=True)
 
-session = Session("--pattern", "1-1", "--cycles", "1", "--animation", "path")
+session = Session("--pattern", "1-1", "--cycles", "1", "--animation", "path", "--bell")
 try:
+    assert b"\x1b[1;36m" in session.output, "expected ANSI phase color by default"
     os.write(session.master, b" ")
     session.read(0.15)
-    frozen = session.read(2.1)
+    frozen = ANSI_SGR.sub(b"", session.read(2.1))
     assert session.process.poll() is None, "pause consumed the cycle limit"
     assert b"Paused" in frozen
     bars = re.findall(rb"\[[=.o]+\]", frozen)
@@ -96,18 +103,36 @@ try:
     os.write(session.master, b"r ")
     session.finish()
     assert b"Exhale" in session.output
+    assert b"\x07" in session.output, "expected terminal bell on phase transition"
 finally:
     session.close()
 
-session_es = Session("--lang", "es", "--pattern", "1-1", "--cycles", "1", expected_start=b"Inhala")
+with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as cfg:
+    cfg.write("auto_hide = true\nauto_hide_secs = 0.5\n")
+    cfg_path = cfg.name
+
 try:
-    os.write(session_es.master, b" ")
-    session_es.read(0.2)
-    assert b"Pausa" in session_es.output
-    os.write(session_es.master, b"q")
-    session_es.finish()
+    session_es = Session(
+        "--lang", "es", "--no-color", "--pattern", "1-1",
+        expected_start=b"Inhala", extra_env={"RESPIRO_CONFIG": cfg_path},
+    )
+    try:
+        assert b"\x1b[1;36m" not in session_es.output, "--no-color did not disable colors"
+        os.write(session_es.master, b"a")
+        chunk = session_es.read(0.25)
+        assert b"@" in chunk, "live animation toggle 'a' did not switch to path"
+        session_es.read(0.5)
+        later = session_es.read(0.3)
+        assert b"espacio pausa" not in later, "auto_hide from config file did not hide controls"
+        os.write(session_es.master, b" ")
+        session_es.read(0.2)
+        assert b"Pausa" in session_es.output
+        os.write(session_es.master, b"q")
+        session_es.finish()
+    finally:
+        session_es.close()
 finally:
-    session_es.close()
+    os.unlink(cfg_path)
 
 for animation in ["orb", "path"]:
     result = subprocess.run([str(BINARY), "--snapshot", "--animation", animation], capture_output=True, check=True)
@@ -115,4 +140,4 @@ for animation in ["orb", "path"]:
     assert not re.search(rb"\d", result.stdout)
 result = subprocess.run([str(BINARY)], capture_output=True)
 assert result.returncode != 0 and b"--snapshot" in result.stderr
-print("PTY OK: keyboard, signals, pause, reset, resize, cycle limit, lang (en/es), cleanup and snapshots")
+print("PTY OK: keyboard, signals, pause, reset, resize, live keys, bell, colors, config auto-hide, lang (en/es), cleanup and snapshots")

@@ -4,8 +4,9 @@ mod render;
 mod terminal;
 
 use std::{
-    env,
+    env, fs,
     io::{self, IsTerminal, Write},
+    path::PathBuf,
     process::ExitCode,
     time::{Duration, Instant},
 };
@@ -22,18 +23,21 @@ Usage: respiro-cli [options]
   -a, --animation TYPE   orb (expanding circle) or path (phase perimeter)
   -c, --cycles N         Stop after N full cycles; unlimited by default
   -l, --lang LANG        en (default) or es (Spanish translation)
+  -b, --bell             Ring terminal bell (\\a) on phase transitions
+      --no-color         Disable subtle ANSI phase colors (also respects NO_COLOR)
+      --auto-hide        Auto-hide bottom controls after inactivity
       --compact          Three-line inline animation inside current terminal
       --snapshot         Print a static ASCII frame without ANSI controls and exit
       --list-patterns    List available breathing patterns
   -h, --help             Show this help
   -V, --version          Show version
 
-Controls: Space pause/resume · r reset · q / Esc / Ctrl+C quit
-No timers or numerical countdowns are shown during the session. Requires an ANSI terminal.
+Controls: Space pause/resume · r reset · a/Tab animation · p/1-4 pattern · q/Esc quit
+Config:   ~/.config/respiro-tty/config.conf (e.g. auto_hide = true, auto_hide_secs = 3.5)
 Examples:
   respiro-cli --pattern 4-7-8 --animation path
   respiro-cli --pattern 4-0-6-0 --compact --cycles 3
-  respiro-cli --lang es --pattern relax
+  respiro-cli --lang es --pattern relax --bell
   fastfetch --logo-type command-raw --logo 'respiro-cli --snapshot'
 ";
 
@@ -49,18 +53,21 @@ Uso: respiro-cli [opciones]
   -a, --animation TIPO   orb (expansion) o path (recorrido por fase)
   -c, --cycles N         Termina tras N ciclos completos; por defecto sin limite
   -l, --lang IDIOMA      en (por defecto) o es (traduccion al espanol)
+  -b, --bell             Emite campana de terminal (\\a) al cambiar de fase
+      --no-color         Desactiva colores ANSI (tambien respeta NO_COLOR)
+      --auto-hide        Auto-oculta los controles tras unos segundos
       --compact          Animacion de tres lineas dentro de la terminal
       --snapshot         Imprime un fotograma ASCII sin controles ANSI y termina
       --list-patterns    Muestra los patrones disponibles
   -h, --help             Muestra esta ayuda
   -V, --version          Muestra la version
 
-Controles: Espacio pausa/reanuda · r reinicia · q / Esc / Ctrl+C sale
-La sesion no muestra tiempos ni cuentas numericas. Requiere una terminal ANSI.
+Controles: Espacio pausa/reanuda · r reinicia · a/Tab animacion · p/1-4 patron · q/Esc sale
+Config:    ~/.config/respiro-tty/config.conf (ej. auto_hide = true, auto_hide_secs = 3.5)
 Ejemplos:
   respiro-cli --pattern 4-7-8 --animation path
   respiro-cli --pattern 4-0-6-0 --compact --cycles 3
-  respiro-cli --lang es --pattern relax
+  respiro-cli --lang es --pattern relax --bell
   fastfetch --logo-type command-raw --logo 'respiro-cli --snapshot'
 ";
 
@@ -72,18 +79,17 @@ enum Lang {
 
 impl Lang {
     fn from_str(value: &str) -> Result<Self, String> {
-        match value.to_ascii_lowercase().as_str() {
+        match value.trim().to_ascii_lowercase().as_str() {
             "en" | "eng" | "english" => Ok(Self::En),
             "es" | "esp" | "spanish" | "espanol" | "español" => Ok(Self::Es),
             _ => Err(format!("unsupported language '{value}': use 'en' or 'es'")),
         }
     }
 
-    fn from_env() -> Self {
+    fn from_env() -> Option<Self> {
         env::var("RESPIRO_LANG")
             .ok()
             .and_then(|v| Self::from_str(&v).ok())
-            .unwrap_or(Self::En)
     }
 }
 
@@ -93,7 +99,16 @@ enum Animation {
     Path,
 }
 
-#[derive(Debug)]
+impl Animation {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Orb => Self::Path,
+            Self::Path => Self::Orb,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Options {
     durations: [f64; 4],
     animation: Animation,
@@ -101,6 +116,116 @@ struct Options {
     compact: bool,
     snapshot: bool,
     lang: Lang,
+    color: bool,
+    bell: bool,
+    auto_hide: bool,
+    auto_hide_secs: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            durations: patterns::PRESETS[0].durations,
+            animation: Animation::Orb,
+            cycles: None,
+            compact: false,
+            snapshot: false,
+            lang: Lang::from_env().unwrap_or(Lang::En),
+            color: env::var_os("NO_COLOR").is_none(),
+            bell: false,
+            auto_hide: false,
+            auto_hide_secs: 3.5,
+        }
+    }
+}
+
+fn config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(custom) = env::var_os("RESPIRO_CONFIG") {
+        paths.push(PathBuf::from(custom));
+    }
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    if let Some(dir) = base {
+        paths.push(dir.join("respiro-tty").join("config.conf"));
+        paths.push(dir.join("respiro").join("cli.conf"));
+    }
+    paths
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn apply_config_str(options: &mut Options, content: &str) {
+    for line in content.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim();
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            match key {
+                "auto_hide" => {
+                    if let Some(b) = parse_bool(val) {
+                        options.auto_hide = b;
+                    }
+                }
+                "auto_hide_secs" => {
+                    if let Ok(secs) = val.parse::<f64>() {
+                        if secs.is_finite() && (0.5..=60.0).contains(&secs) {
+                            options.auto_hide_secs = secs;
+                        }
+                    }
+                }
+                "lang" => {
+                    if env::var_os("RESPIRO_LANG").is_none() {
+                        if let Ok(l) = Lang::from_str(val) {
+                            options.lang = l;
+                        }
+                    }
+                }
+                "pattern" => {
+                    if let Ok(d) = pattern(val, options.lang) {
+                        options.durations = d;
+                    }
+                }
+                "animation" => match val {
+                    "orb" => options.animation = Animation::Orb,
+                    "path" => options.animation = Animation::Path,
+                    _ => {}
+                },
+                "color" => {
+                    if env::var_os("NO_COLOR").is_none() {
+                        if let Some(b) = parse_bool(val) {
+                            options.color = b;
+                        }
+                    }
+                }
+                "bell" => {
+                    if let Some(b) = parse_bool(val) {
+                        options.bell = b;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn load_config(options: &mut Options) {
+    for path in config_paths() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            apply_config_str(options, &content);
+            break;
+        }
+    }
 }
 
 fn pattern(value: &str, lang: Lang) -> Result<[f64; 4], String> {
@@ -123,7 +248,9 @@ fn pattern(value: &str, lang: Lang) -> Result<[f64; 4], String> {
         Ok([i, h, e, r]) => [*i, *h, *e, *r],
         _ => {
             return Err(match lang {
-                Lang::En => "invalid pattern: use 2, 3, or 4 durations separated by '-' or ','".into(),
+                Lang::En => {
+                    "invalid pattern: use 2, 3, or 4 durations separated by '-' or ','".into()
+                }
                 Lang::Es => "patron invalido: usa 2, 3 o 4 tiempos separados por '-' o ','".into(),
             });
         }
@@ -141,8 +268,10 @@ fn pattern(value: &str, lang: Lang) -> Result<[f64; 4], String> {
 }
 
 fn detect_lang_arg(args: &[String]) -> Lang {
+    let mut options = Options::default();
+    load_config(&mut options);
+    let mut lang = options.lang;
     let mut iter = args.iter();
-    let mut lang = Lang::from_env();
     while let Some(arg) = iter.next() {
         if arg == "-l" || arg == "--lang" {
             if let Some(val) = iter.next() {
@@ -161,21 +290,20 @@ fn detect_lang_arg(args: &[String]) -> Lang {
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let collected: Vec<String> = args.into_iter().collect();
+    let mut options = Options::default();
+    load_config(&mut options);
     let mut lang = detect_lang_arg(&collected);
-    let mut options = Options {
-        durations: patterns::PRESETS[0].durations,
-        animation: Animation::Orb,
-        cycles: None,
-        compact: false,
-        snapshot: false,
-        lang,
-    };
+    options.lang = lang;
     let mut raw_pattern: Option<String> = None;
     let mut iter = collected.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--compact" => options.compact = true,
             "--snapshot" => options.snapshot = true,
+            "-b" | "--bell" => options.bell = true,
+            "--no-color" => options.color = false,
+            "--auto-hide" => options.auto_hide = true,
+            "--no-auto-hide" => options.auto_hide = false,
             "-l" | "--lang" => {
                 let val = iter.next().ok_or(match lang {
                     Lang::En => "missing language code (use 'en' or 'es')",
@@ -275,7 +403,20 @@ fn breath_at(durations: [f64; 4], elapsed: f64) -> Breath {
     }
 }
 
-fn run(options: Options) -> io::Result<()> {
+fn next_preset_durations(current: [f64; 4]) -> [f64; 4] {
+    let presets: Vec<[f64; 4]> = patterns::PRESETS
+        .iter()
+        .filter(|p| p.name != "Personalizado")
+        .map(|p| p.durations)
+        .collect();
+    let idx = presets
+        .iter()
+        .position(|&d| d == current)
+        .map_or(0, |i| (i + 1) % presets.len());
+    presets[idx]
+}
+
+fn run(mut options: Options) -> io::Result<()> {
     if options.snapshot {
         let breath = breath_at(options.durations, options.durations[0] * 0.65);
         let lines = render::frame(&options, breath, false, 39, 19, false);
@@ -292,46 +433,82 @@ fn run(options: Options) -> io::Result<()> {
     {
         return Err(io::Error::other(match options.lang {
             Lang::En => "use an interactive ANSI terminal; for Fastfetch or piping use --snapshot",
-            Lang::Es => "usa una terminal ANSI interactiva; para Fastfetch o redireccionar usa --snapshot",
+            Lang::Es => {
+                "usa una terminal ANSI interactiva; para Fastfetch o redireccionar usa --snapshot"
+            }
         }));
     }
     let mut terminal = terminal::Terminal::enter(options.compact)?;
     let mut elapsed = Duration::ZERO;
     let mut last = Instant::now();
+    let mut last_input = Instant::now();
     let mut paused = false;
-    let limit = options
-        .cycles
-        .map(|n| options.durations.iter().sum::<f64>() * n as f64);
+    let mut last_phase = breath_at(options.durations, 0.0).phase;
     loop {
         let now = Instant::now();
         if !paused {
             elapsed += now.duration_since(last);
         }
         last = now;
+        let limit = options
+            .cycles
+            .map(|n| options.durations.iter().sum::<f64>() * n as f64);
         if terminal::interrupted() || limit.is_some_and(|limit| elapsed.as_secs_f64() >= limit) {
             break;
         }
+        let breath = breath_at(options.durations, elapsed.as_secs_f64());
+        if !paused && breath.phase != last_phase {
+            last_phase = breath.phase;
+            if options.bell {
+                terminal.bell()?;
+            }
+        }
+        let show_controls = paused
+            || !options.auto_hide
+            || now.duration_since(last_input).as_secs_f64() < options.auto_hide_secs;
         let (width, height) = terminal.size();
-        let lines = render::frame(
-            &options,
-            breath_at(options.durations, elapsed.as_secs_f64()),
-            paused,
-            width,
-            height,
-            true,
-        );
-        terminal.draw(&lines, width, height)?;
+        let lines = render::frame(&options, breath, paused, width, height, show_controls);
+        let accent = if options.color {
+            Some(if paused {
+                "33"
+            } else {
+                ["36", "34", "32", "35"][breath.phase]
+            })
+        } else {
+            None
+        };
+        terminal.draw(&lines, width, height, accent)?;
         if let Some(key) = terminal.key(Duration::from_millis(40))? {
-            // Account for time waiting for input before changing the pause state.
+            // Account for time waiting for input before changing state.
             let now = Instant::now();
             if !paused {
                 elapsed += now.duration_since(last);
             }
             last = now;
+            last_input = now;
             match key {
                 b'q' | b'Q' | 27 | 3 | 4 => break,
                 b' ' => paused = !paused,
-                b'r' | b'R' => elapsed = Duration::ZERO,
+                b'r' | b'R' => {
+                    elapsed = Duration::ZERO;
+                    last_phase = breath_at(options.durations, 0.0).phase;
+                }
+                b'a' | b'A' | b'\t' => {
+                    options.animation = options.animation.toggle();
+                }
+                b'p' | b'P' => {
+                    options.durations = next_preset_durations(options.durations);
+                    elapsed = Duration::ZERO;
+                    last_phase = breath_at(options.durations, 0.0).phase;
+                }
+                b'1'..=b'4' => {
+                    let idx = (key - b'1') as usize;
+                    if idx < 4 {
+                        options.durations = patterns::PRESETS[idx].durations;
+                        elapsed = Duration::ZERO;
+                        last_phase = breath_at(options.durations, 0.0).phase;
+                    }
+                }
                 _ => {}
             }
         }
@@ -343,10 +520,13 @@ fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
     let lang = detect_lang_arg(&args);
     if args.iter().any(|s| s == "--help" || s == "-h") {
-        print!("{}", match lang {
-            Lang::En => HELP_EN,
-            Lang::Es => HELP_ES,
-        });
+        print!(
+            "{}",
+            match lang {
+                Lang::En => HELP_EN,
+                Lang::Es => HELP_ES,
+            }
+        );
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|s| s == "--version" || s == "-V") {
@@ -378,9 +558,15 @@ mod tests {
     use super::*;
     #[test]
     fn patterns_validate_and_map_phases() {
-        assert_eq!(pattern("coherent", Lang::En).unwrap(), [5.0, 0.0, 5.0, 0.0]);
+        assert_eq!(
+            pattern("coherent", Lang::En).unwrap(),
+            [5.0, 0.0, 5.0, 0.0]
+        );
         assert_eq!(pattern("4-7-8", Lang::En).unwrap(), [4.0, 7.0, 8.0, 0.0]);
-        assert_eq!(pattern("2.5,0,6,1", Lang::Es).unwrap(), [2.5, 0.0, 6.0, 1.0]);
+        assert_eq!(
+            pattern("2.5,0,6,1", Lang::Es).unwrap(),
+            [2.5, 0.0, 6.0, 1.0]
+        );
         for invalid in ["0-0", "NaN-5", "inf-5", "31-5", "4--2-6", "1", "1-2-3-4-5"] {
             assert!(pattern(invalid, Lang::En).is_err(), "{invalid}");
             assert!(pattern(invalid, Lang::Es).is_err(), "{invalid}");
@@ -399,12 +585,25 @@ mod tests {
         assert_eq!(breath_at(d, 19.0).phase, 0);
     }
     #[test]
-    fn rejects_invalid_options_and_supports_lang() {
+    fn rejects_invalid_options_and_supports_lang_and_config() {
+        let mut opts = Options::default();
+        assert!(!opts.auto_hide);
+        apply_config_str(
+            &mut opts,
+            "# comment\nauto_hide = true\nauto_hide_secs = 2.0\nanimation = path\nbell = true\ncolor = false\n",
+        );
+        assert!(opts.auto_hide);
+        assert_eq!(opts.auto_hide_secs, 2.0);
+        assert_eq!(opts.animation, Animation::Path);
+        assert!(opts.bell);
+        assert!(!opts.color);
+
         assert_eq!(
             parse(["--lang", "es"].map(String::from)).unwrap().lang,
             Lang::Es
         );
-        assert_eq!(parse(["--compact"].map(String::from)).unwrap().lang, Lang::En);
+        assert!(parse(["--bell", "--no-color", "--auto-hide"].map(String::from))
+            .is_ok_and(|o| o.bell && !o.color && o.auto_hide));
         for args in [
             vec!["--cycles", "0"],
             vec!["--cycles", "-1"],

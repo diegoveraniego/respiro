@@ -29,11 +29,13 @@ pub fn frame(
         (Lang::En, false) => ["Inhale", "Hold", "Exhale", "Rest"][breath.phase],
         (Lang::Es, false) => ["Inhala", "Manten", "Exhala", "Descansa"][breath.phase],
     };
-    let controls_hint = match options.lang {
-        Lang::En => "space pause | r reset | q quit",
-        Lang::Es => "espacio pausa | r reinicia | q sale",
-    };
     let width = width.saturating_sub(2).clamp(1, 61);
+    let controls_hint = match (options.lang, width >= 56) {
+        (Lang::En, true) => "space pause | r reset | a anim | p pattern | q quit",
+        (Lang::En, false) => "space pause | r reset | q quit",
+        (Lang::Es, true) => "espacio pausa | r reinicia | a anim | p patron | q sale",
+        (Lang::Es, false) => "espacio pausa | r reinicia | q sale",
+    };
     if options.compact || height < 12 || width < 23 {
         let bar_width = width.saturating_sub(2).clamp(1, 31);
         return vec![
@@ -41,8 +43,10 @@ pub fn frame(
             format!("[{}]", progress(breath.progress, bar_width)),
             if controls {
                 controls_hint.into()
-            } else {
+            } else if options.snapshot {
                 "respiro".into()
+            } else {
+                String::new()
             },
         ];
     }
@@ -127,6 +131,8 @@ pub fn frame(
     lines.push(format!("[{}]", progress(breath.progress, 21)));
     if controls {
         lines.push(controls_hint.into());
+    } else if !options.snapshot {
+        lines.push(String::new());
     }
     lines
 }

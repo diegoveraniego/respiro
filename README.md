@@ -102,8 +102,14 @@ números ni cuenta atrás. Arranca automáticamente y continúa hasta salir.
   actual, sin entrar en pantalla completa.
 - `--lang es` / `-l es`: cambia los textos de la sesión y la ayuda al español
   (por defecto `en`).
-- **Espacio** pausa/reanuda; **r** reinicia la sesión; **q**, **Esc** o **Ctrl+C**
-  salen y restauran la terminal. La pantalla completa se adapta al tamaño.
+- `--no-color`: desactiva los colores ANSI por fase (también respeta `NO_COLOR`).
+- `--bell` / `-b`: emite campana de terminal (`\a`) al cambiar de fase.
+- `--auto-hide`: auto-oculta la barra inferior de controles tras unos segundos de
+  inactividad (también configurable de forma persistente con `auto_hide = true` y
+  `auto_hide_secs = 3.5` en `~/.config/respiro-tty/config.conf` o `~/.config/respiro/cli.conf`).
+- **Espacio** pausa/reanuda; **r** reinicia la sesión; **a** / **Tab** alterna entre
+  `orb` y `path` en vivo; **p** o **1**–**4** cambia el patrón en vivo; **q**, **Esc**
+  o **Ctrl+C** salen y restauran la terminal. La pantalla completa se adapta al tamaño.
 
 ```bash
 respiro-cli --pattern 4-7-8 --animation path

@@ -79,7 +79,13 @@ impl Terminal {
         }
     }
 
-    pub fn draw(&mut self, lines: &[String], width: usize, height: usize) -> io::Result<()> {
+    pub fn draw(
+        &mut self,
+        lines: &[String],
+        width: usize,
+        height: usize,
+        color: Option<&str>,
+    ) -> io::Result<()> {
         // Submit each frame together to avoid flicker between clearing and drawing.
         let mut out = Vec::new();
         let count = lines.len().min(height);
@@ -105,11 +111,22 @@ impl Terminal {
             } else {
                 width.saturating_sub(line.len()) / 2
             };
-            write!(out, "\x1b[2K{:padding$}{line}", "")?;
+            write!(out, "\x1b[2K{:padding$}", "")?;
+            if let Some(accent) = color {
+                write_colored_line(&mut out, line, accent)?;
+            } else {
+                write!(out, "{line}")?;
+            }
         }
         self.rows = count;
         let mut stdout = io::stdout().lock();
         stdout.write_all(&out)?;
+        stdout.flush()
+    }
+
+    pub fn bell(&mut self) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"\x07")?;
         stdout.flush()
     }
 
@@ -147,6 +164,26 @@ impl Terminal {
         }
         Ok(None)
     }
+}
+
+fn write_colored_line(out: &mut Vec<u8>, line: &str, accent: &str) -> io::Result<()> {
+    let trimmed = line.trim();
+    if trimmed == "respiro" || trimmed.contains('|') {
+        return write!(out, "\x1b[2m{line}\x1b[0m");
+    }
+    if trimmed.chars().all(|c| c.is_ascii_alphabetic()) && !trimmed.is_empty() {
+        return write!(out, "\x1b[1;{accent}m{line}\x1b[0m");
+    }
+    for ch in line.chars() {
+        match ch {
+            '.' | '[' | ']' => write!(out, "\x1b[2m{ch}\x1b[0m")?,
+            '+' => write!(out, "\x1b[{accent}m+\x1b[0m")?,
+            '*' | ':' | '-' | '=' => write!(out, "\x1b[{accent}m{ch}\x1b[0m")?,
+            '@' | 'o' => write!(out, "\x1b[1;{accent}m{ch}\x1b[0m")?,
+            _ => write!(out, "{ch}")?,
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Terminal {
