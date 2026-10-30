@@ -278,7 +278,7 @@ fn breath_at(durations: [f64; 4], elapsed: f64) -> Breath {
 fn run(options: Options) -> io::Result<()> {
     if options.snapshot {
         let breath = breath_at(options.durations, options.durations[0] * 0.65);
-        let lines = render::frame(&options, breath, false, 39, 21, false);
+        let lines = render::frame(&options, breath, false, 39, 19, false);
         let width = lines.iter().map(String::len).max().unwrap_or(0);
         let lines: Vec<_> = lines
             .iter()
