@@ -51,8 +51,8 @@ pub fn frame(
     let mut canvas = vec![vec![' '; art_width]; art_height];
     let cx = (art_width - 1) as f64 / 2.0;
     let cy = (art_height - 1) as f64 / 2.0;
-    let rx = cx - 2.0;
     let ry = cy - 1.0;
+    let rx = (cx - 2.0).min(ry * 2.2);
     let mut point = |x: f64, y: f64, ch: char| {
         let x = x.round().clamp(0.0, (art_width - 1) as f64) as usize;
         let y = y.round().clamp(0.0, (art_height - 1) as f64) as usize;
@@ -78,27 +78,34 @@ pub fn frame(
         Animation::Path => {
             let active: Vec<_> = (0..4).filter(|&i| options.durations[i] > 0.0).collect();
             let current = active.iter().position(|&i| i == breath.phase).unwrap_or(0);
-            let vertices = match active.len() {
-                2 => vec![(cx, cy + ry), (cx, cy - ry)],
-                3 => vec![(cx - rx, cy + ry), (cx, cy - ry), (cx + rx, cy + ry)],
-                _ => vec![
-                    (cx - rx, cy + ry),
-                    (cx - rx, cy - ry),
-                    (cx + rx, cy - ry),
-                    (cx + rx, cy + ry),
-                ],
+            let (vertices, bow): (Vec<(f64, f64)>, f64) = match active.len() {
+                2 => (vec![(0.0, 0.95), (0.0, -0.95)], 0.65),
+                3 => (vec![(-0.82, 0.72), (0.0, -0.88), (0.82, 0.72)], 0.24),
+                _ => (
+                    vec![
+                        (-0.76, 0.76),
+                        (-0.76, -0.76),
+                        (0.76, -0.76),
+                        (0.76, 0.76),
+                    ],
+                    0.24,
+                ),
             };
+            let n = vertices.len();
             let position = |edge: usize, t: f64| {
                 let a = vertices[edge];
-                let b = vertices[(edge + 1) % vertices.len()];
-                let bow = if vertices.len() == 2 {
-                    (std::f64::consts::PI * t).sin() * rx * if edge == 0 { -1.0 } else { 1.0 }
-                } else {
-                    0.0
-                };
-                (a.0 + (b.0 - a.0) * t + bow, a.1 + (b.1 - a.1) * t)
+                let b = vertices[(edge + 1) % n];
+                let dx = b.0 - a.0;
+                let dy = b.1 - a.1;
+                let len = dx.hypot(dy).max(f64::EPSILON);
+                let nx = dy / len;
+                let ny = -dx / len;
+                let curve = (std::f64::consts::PI * t).sin() * bow;
+                let ux = a.0 + dx * t + nx * curve;
+                let uy = a.1 + dy * t + ny * curve;
+                (cx + ux * rx, cy + uy * ry)
             };
-            for edge in 0..vertices.len() {
+            for edge in 0..n {
                 for step in 0..200 {
                     let t = step as f64 / 199.0;
                     let (x, y) = position(edge, t);
@@ -113,8 +120,8 @@ pub fn frame(
                     );
                 }
             }
-            for &(x, y) in &vertices {
-                point(x, y, '+');
+            for &(vx, vy) in &vertices {
+                point(cx + vx * rx, cy + vy * ry, '+');
             }
             let (x, y) = position(current, breath.progress);
             point(x, y, '@');
